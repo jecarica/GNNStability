@@ -155,7 +155,7 @@ class HKGraphDataset(TUDataset):
         return dense_to_sparse(A2)[0]
 
     def _attach_all_features(self):
-        print("⏳ Attaching node features + HK-style windowed persistence images…")
+        print("Attaching node features + HK-style windowed persistence images…")
         start = time.time()
         data_list = []
         for i in range(len(self)):
@@ -182,7 +182,7 @@ class HKGraphDataset(TUDataset):
 
         # Replace in-memory storage with enriched data:
         self.data, self.slices = self.collate(data_list)
-        print(f"✅ Attached in {time.time() - start:.1f}s | topo_dim={2 * (self.res * self.res)}")
+        print(f"Attached in {time.time() - start:.1f}s | topo_dim={2 * (self.res * self.res)}")
 
 
 # --------------------------------------------
