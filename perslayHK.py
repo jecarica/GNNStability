@@ -17,8 +17,6 @@ from torch_geometric.datasets import TUDataset
 from torch.nn.utils.parametrizations import spectral_norm
 
 # Import necessary functions from Perslay code
-import itertools
-import h5py
 from scipy.sparse import csgraph
 from scipy.linalg import eigh
 
@@ -229,7 +227,7 @@ class PerslayGraphDataset(TUDataset):
         return diagram
 
     def _attach_all_features(self):
-        print(f"⏳ Attaching node features + Perslay extended persistence diagrams for {self.name}…")
+        print(f"Attaching node features + Perslay extended persistence diagrams for {self.name}…")
         start = time.time()
         data_list = []
 
