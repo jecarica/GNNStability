@@ -554,7 +554,7 @@ if __name__ == "__main__":
     SEED = 17
     L_PI = 1.0
     EPOCHS = 50
-    DATASET_NAME = "REDDIT-BINARY"  # Change to any TUDataset name
+    DATASET_NAME = "NCI1"  # Change to any TUDataset name
     MAX_POINTS_PER_DIAGRAM = 50  # Maximum points per persistence diagram
 
     set_seed(SEED)
