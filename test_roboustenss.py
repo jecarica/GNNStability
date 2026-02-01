@@ -54,7 +54,7 @@ def evaluate(model, loader, perturb=False):
 
 if __name__ == "__main__":
     print("=== IMDB-BINARY ===")
-    ds = NetworkRepoDataset(root="data/IMDB-BINARY", name="IMDB-BINARY")
+    ds = NetworkRepoDataset(root="data/MUTAG", name="MUTAG")
     ds = ds.shuffle()
     split = int(0.8 * len(ds))
     train_ds, test_ds = ds[:split], ds[split:]
