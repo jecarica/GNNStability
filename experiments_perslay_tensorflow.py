@@ -1,18 +1,23 @@
 """
 TensorFlow counterpart of perslayTF.py: GIN + Perslay (GUDHI) + Hiraoka–Kusano stability.
-Same architecture as PerslayGIN_HK: structural (GIN) + topological (Perslay) branches,
+Same high-level idea as PerslayGIN_HK: structural (GIN) + topological (Perslay) branches,
 classifier on concat, and optional HK stability loss on (original, perturbed) diagrams.
+
+Alignment with perslayTF.py:
+- Diagram masks are used: only valid (non-padded) points are passed to Perslay (via
+  _to_ragged_batch(..., M_list=M)), matching the PyTorch PermutationEquivariant + masks.
+- Perslay branch here uses GUDHI's GaussianPerslayPhi (image-based); perslayTF uses
+  PermutationEquivariant MLP + max. So the topological representation differs; accuracy
+  can still differ. Classifier head in PyTorch uses spectral norm + orthogonal init;
+  here it is plain Dense.
+- Default run is ONE config (full model) and 1 run so runtime is comparable to perslayTF.
+  Use --ablation for the full 4-config × n_runs grid (much slower).
 
 Install: pip install gudhi tensorflow  (and torch/torch_geometric for TUDataset loading)
 
-Run: python experiments_perslay_tensorflow.py --dataset MUTAG --n_runs 5
-Quick run: python experiments_perslay_tensorflow.py --dataset MUTAG --quick
-
-Why it can be slow:
-- First model call does TF graph build + GUDHI Perslay init (~1–2 min once per process).
-- Each batch does two forward passes (original + perturbed) for the HK stability loss.
-- Default: 100 epochs × 4 ablation configs × 5 runs = 2000 training runs total.
-- Use --quick (20 epochs, 2 runs) or --single (one config only) to reduce time.
+Run (single config, ~same as perslayTF): python experiments_perslay_tensorflow.py --dataset MUTAG
+Full ablation: python experiments_perslay_tensorflow.py --dataset MUTAG --ablation --n_runs 3
+Quick: python experiments_perslay_tensorflow.py --dataset MUTAG --quick
 """
 import os
 import sys
@@ -381,30 +386,42 @@ def build_gin_perslay_model(
     use_gin=True, use_perslay=True,
     phi_size=(5, 5), image_bnds=((-0.01, 1.01), (-0.01, 1.01)), variance=0.1,
 ):
-    """Two branches: GIN (x, edge_index, batch) -> g_gin; Perslay (ragged diagrams) -> g_perslay; concat -> fc -> logits."""
-    # Graph inputs with batch dim: (1, total_nodes, in_dim), (1, E, 2), (1, total_nodes)
-    inp_x = tf.keras.Input(shape=(None, in_dim), name="x")
-    inp_edge_index = tf.keras.Input(shape=(None, 2), dtype=tf.int32, name="edge_index")
-    inp_batch = tf.keras.Input(shape=(None,), dtype=tf.int32, name="batch")
-    inp_diagrams = [tf.keras.Input(shape=(None, 2), ragged=True, name=f"diag_{k}") for k in range(num_filtrations)]
+    """Two branches: GIN (x, edge_index, batch) -> g_gin; Perslay (ragged diagrams) -> g_perslay; concat -> fc -> logits.
+    Only declares inputs that are used so Keras does not raise 'inputs not connected to outputs' for ablation configs."""
+    # Graph inputs (only when GIN is used)
+    if use_gin:
+        inp_x = tf.keras.Input(shape=(None, in_dim), name="x")
+        inp_edge_index = tf.keras.Input(shape=(None, 2), dtype=tf.int32, name="edge_index")
+        inp_batch = tf.keras.Input(shape=(None,), dtype=tf.int32, name="batch")
+    else:
+        inp_x = inp_edge_index = inp_batch = None
 
-    # GIN branch inside a Layer so tf.shape etc. run at call time
+    # Diagram inputs (only when Perslay is used)
+    if use_perslay:
+        inp_diagrams = [tf.keras.Input(shape=(None, 2), ragged=True, name=f"diag_{k}") for k in range(num_filtrations)]
+    else:
+        inp_diagrams = None
+
+    # GIN branch
     if use_gin:
         gin_layer = GINBranchLayer(in_dim, hidden_dim)
         g_gin = gin_layer([inp_x, inp_edge_index, inp_batch])
     else:
         g_gin = None
 
-    # Perslay branch (GUDHI)
-    perslay_outs = []
-    for k in range(num_filtrations):
-        weight = prsl.PowerPerslayWeight(1.0, 0.0)
-        phi = prsl.GaussianPerslayPhi(phi_size, image_bnds, variance)
-        layer = prsl.Perslay(weight=weight, phi=phi, perm_op=tf.math.reduce_max, rho=tf.keras.layers.Flatten())
-        perslay_outs.append(layer(inp_diagrams[k]))
-    perslay_concat = tf.keras.layers.Concatenate()(perslay_outs)
-    g_perslay = tf.keras.layers.Dense(hidden_dim, activation="relu")(perslay_concat)
-    g_perslay = tf.keras.layers.Dropout(0.5)(g_perslay)
+    # Perslay branch (only when use_perslay)
+    if use_perslay:
+        perslay_outs = []
+        for k in range(num_filtrations):
+            weight = prsl.PowerPerslayWeight(1.0, 0.0)
+            phi = prsl.GaussianPerslayPhi(phi_size, image_bnds, variance)
+            layer = prsl.Perslay(weight=weight, phi=phi, perm_op=tf.math.reduce_max, rho=tf.keras.layers.Flatten())
+            perslay_outs.append(layer(inp_diagrams[k]))
+        perslay_concat = tf.keras.layers.Concatenate()(perslay_outs)
+        g_perslay = tf.keras.layers.Dense(hidden_dim, activation="relu")(perslay_concat)
+        g_perslay = tf.keras.layers.Dropout(0.5)(g_perslay)
+    else:
+        g_perslay = None
 
     if use_gin and use_perslay:
         g = tf.keras.layers.Concatenate()([g_gin, g_perslay])
@@ -417,7 +434,7 @@ def build_gin_perslay_model(
     g = tf.keras.layers.Dropout(0.5)(g)
     logits = tf.keras.layers.Dense(num_classes, activation="softmax")(g)
 
-    inputs = [inp_x, inp_edge_index, inp_batch] + inp_diagrams
+    inputs = ([inp_x, inp_edge_index, inp_batch] if use_gin else []) + (inp_diagrams if use_perslay else [])
     return tf.keras.Model(inputs=inputs, outputs=logits)
 
 
@@ -446,12 +463,29 @@ def stratified_split_indices(labels, train_ratio=0.8, seed=42):
     return np.array(train_idx), np.array(test_idx)
 
 
-def _to_ragged_batch(D_list, indices):
-    """Convert list of (N, max_pts, 2) arrays to list of RaggedTensors for the batch indices."""
-    return [
-        tf.RaggedTensor.from_tensor(tf.constant(D_list[k][indices], dtype=tf.float32))
-        for k in range(len(D_list))
-    ]
+def _to_ragged_batch(D_list, indices, M_list=None):
+    """Convert list of (N, max_pts, 2) arrays to list of RaggedTensors for the batch indices.
+    If M_list is provided (masks True = valid point), only valid points are included so
+    Perslay does not see zero-padding (matches perslayTF.py PermutationEquivariant + masks)."""
+    out = []
+    for k in range(len(D_list)):
+        Dk = D_list[k][indices]  # (B, max_pts, 2)
+        if M_list is not None:
+            Mk = M_list[k][indices]  # (B, max_pts)
+            row_lengths = np.array(Mk.sum(axis=1), dtype=np.int64)
+            parts = []
+            for i in range(len(indices)):
+                valid = Dk[i][Mk[i]]  # (n_valid_i, 2)
+                parts.append(valid)
+            if len(parts) == 0:
+                values = np.zeros((0, 2), dtype=np.float32)
+            else:
+                values = np.concatenate(parts, axis=0).astype(np.float32)
+            rt = tf.RaggedTensor.from_row_lengths(values, row_lengths)
+        else:
+            rt = tf.RaggedTensor.from_tensor(tf.constant(Dk, dtype=tf.float32))
+        out.append(rt)
+    return out
 
 
 def _make_dummy_graph_batch(batch_size, in_dim):
@@ -487,11 +521,8 @@ def run_one_fold(
     if verbose:
         print("  Warmup: first model call (TF graph build, may take 1–2 min)...", flush=True)
     ind0 = train_idx[: min(batch_size, len(train_idx))]
-    if use_gin:
-        bx, be, bv = batch_graphs(graph_list, ind0)
-    else:
-        bx, be, bv = _make_dummy_graph_batch(len(ind0), in_dim)
-    _ = model([tf.constant(np.expand_dims(bx, 0)), tf.constant(np.expand_dims(be, 0)), tf.constant(np.expand_dims(bv, 0))] + _to_ragged_batch(D, ind0), training=False)
+    warmup_inputs = _model_inputs(graph_list, D, ind0, in_dim, use_gin, use_perslay, M=M)
+    _ = model(warmup_inputs, training=False)
     if verbose:
         print("  Warmup done. Training...", flush=True)
 
@@ -507,21 +538,19 @@ def run_one_fold(
             else:
                 batch_x, batch_edge, batch_vec = _make_dummy_graph_batch(B, in_dim)
 
-            D_batch = _to_ragged_batch(D, ind)
-            D_pert_batch = _to_ragged_batch(D_pert, ind)
+            D_batch = _to_ragged_batch(D, ind, M_list=M)
+            D_pert_batch = _to_ragged_batch(D_pert, ind, M_list=M_pert)
             L_batch = L_train[batch_idx]
 
-            # Keras expects batch dim first: (1, total_nodes, in_dim), (1, E, 2), (1, total_nodes)
-            batch_x_t = tf.constant(np.expand_dims(batch_x, 0), dtype=tf.float32)
-            batch_edge_t = tf.constant(np.expand_dims(batch_edge, 0), dtype=tf.int32)
-            batch_vec_t = tf.constant(np.expand_dims(batch_vec, 0), dtype=tf.int32)
             with tf.GradientTape() as tape:
                 if verbose and epoch == 0 and start == 0:
                     print("  First forward pass ...", flush=True)
-                logits_o = model([batch_x_t, batch_edge_t, batch_vec_t] + D_batch, training=True)
+                inputs_o = _model_inputs_from_batch(batch_x, batch_edge, batch_vec, D_batch, use_gin, use_perslay)
+                logits_o = model(inputs_o, training=True)
                 if verbose and epoch == 0 and start == 0:
                     print("  First forward done. Second forward (perturbed)...", flush=True)
-                logits_p = model([batch_x_t, batch_edge_t, batch_vec_t] + D_pert_batch, training=True)
+                inputs_p = _model_inputs_from_batch(batch_x, batch_edge, batch_vec, D_pert_batch, use_gin, use_perslay)
+                logits_p = model(inputs_p, training=True)
                 if verbose and epoch == 0 and start == 0:
                     print("  First batch done. Training continues.", flush=True)
                 loss_ce = tf.keras.losses.categorical_crossentropy(L_batch, logits_o)
@@ -542,7 +571,7 @@ def run_one_fold(
             optimizer.apply_gradients(zip(grads, model.trainable_variables))
 
         if (epoch + 1) % 10 == 0:
-            te_acc = _eval_acc(model, graph_list, D, L, test_idx, in_dim, use_gin)
+            te_acc = _eval_acc(model, graph_list, D, L, test_idx, in_dim, use_gin, use_perslay, M=M)
             if te_acc > best_acc:
                 best_acc = te_acc
                 best_weights = [w.numpy().copy() for w in model.weights]
@@ -551,13 +580,35 @@ def run_one_fold(
         for w, bw in zip(model.weights, best_weights):
             w.assign(bw)
 
-    train_acc = _eval_acc(model, graph_list, D, L, train_idx, in_dim, use_gin)
-    test_acc = _eval_acc(model, graph_list, D, L, test_idx, in_dim, use_gin)
+    train_acc = _eval_acc(model, graph_list, D, L, train_idx, in_dim, use_gin, use_perslay, M=M)
+    test_acc = _eval_acc(model, graph_list, D, L, test_idx, in_dim, use_gin, use_perslay, M=M)
     return train_acc, test_acc
 
 
-def _eval_acc(model, graph_list, D, L, indices, in_dim, use_gin):
-    """Evaluate accuracy on a set of indices."""
+def _model_inputs(graph_list, D, indices, in_dim, use_gin, use_perslay, M=None):
+    """Build the list of inputs for the model (graph + diagrams as needed). Uses M to trim diagrams when provided."""
+    if use_gin:
+        batch_x, batch_edge, batch_vec = batch_graphs(graph_list, indices) if graph_list else _make_dummy_graph_batch(len(indices), in_dim)
+    else:
+        batch_x = batch_edge = batch_vec = None
+    D_batch = _to_ragged_batch(D, indices, M_list=M) if use_perslay else None
+    return _model_inputs_from_batch(batch_x, batch_edge, batch_vec, D_batch, use_gin, use_perslay)
+
+
+def _model_inputs_from_batch(batch_x, batch_edge, batch_vec, D_batch, use_gin, use_perslay):
+    """Build model input list from already batched graph and diagram data."""
+    parts = []
+    if use_gin:
+        parts.append(tf.constant(np.expand_dims(batch_x, 0), dtype=tf.float32))
+        parts.append(tf.constant(np.expand_dims(batch_edge, 0), dtype=tf.int32))
+        parts.append(tf.constant(np.expand_dims(batch_vec, 0), dtype=tf.int32))
+    if use_perslay:
+        parts.extend(D_batch)
+    return parts
+
+
+def _eval_acc(model, graph_list, D, L, indices, in_dim, use_gin, use_perslay, M=None):
+    """Evaluate accuracy on a set of indices. Uses M to trim diagram padding when provided."""
     if len(indices) == 0:
         return 0.0
     B = len(indices)
@@ -565,12 +616,10 @@ def _eval_acc(model, graph_list, D, L, indices, in_dim, use_gin):
         batch_x, batch_edge, batch_vec = batch_graphs(graph_list, indices)
     else:
         batch_x, batch_edge, batch_vec = _make_dummy_graph_batch(B, in_dim)
-    batch_x_t = tf.constant(np.expand_dims(batch_x, 0), dtype=tf.float32)
-    batch_edge_t = tf.constant(np.expand_dims(batch_edge, 0), dtype=tf.int32)
-    batch_vec_t = tf.constant(np.expand_dims(batch_vec, 0), dtype=tf.int32)
-    D_batch = _to_ragged_batch(D, indices)
+    D_batch = _to_ragged_batch(D, indices, M_list=M)
+    inputs = _model_inputs_from_batch(batch_x, batch_edge, batch_vec, D_batch, use_gin, use_perslay)
     L_batch = L[indices]
-    logits = model([batch_x_t, batch_edge_t, batch_vec_t] + D_batch, training=False)
+    logits = model(inputs, training=False)
     pred = tf.argmax(logits, axis=1)
     return tf.reduce_mean(tf.cast(tf.argmax(L_batch, axis=1) == pred, tf.float32)).numpy()
 
@@ -579,7 +628,7 @@ def _eval_acc(model, graph_list, D, L, indices, in_dim, use_gin):
 # Ablation study: GIN+Perslay+HK (like perslayTF.py)
 # ---------------------------------------------------------------------------
 def run_ablation_tensorflow(
-    dataset_name="MUTAG",
+    dataset_name="NCI1",
     root="data",
     max_points_per_diagram=50,
     n_runs=5,
@@ -659,12 +708,12 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="MUTAG")
     parser.add_argument("--root", type=str, default="data")
     parser.add_argument("--max_points", type=int, default=50)
-    parser.add_argument("--n_runs", type=int, default=5)
+    parser.add_argument("--n_runs", type=int, default=1, help="Number of seeds (default 1; use 3–5 for ablation)")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--seed_base", type=int, default=42)
     parser.add_argument("--no_cache", action="store_true", help="Disable diagram cache")
-    parser.add_argument("--single", action="store_true", help="Single config (full model) only, no ablation table")
+    parser.add_argument("--ablation", action="store_true", help="Run full ablation (4 configs × n_runs); default is single full model only")
     parser.add_argument("--quick", action="store_true", help="Fewer epochs (20) and runs (2) for faster sanity check")
     args = parser.parse_args()
 
@@ -682,5 +731,5 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         seed_base=args.seed_base,
         use_cache=not args.no_cache,
-        run_ablation_configs=not args.single,
+        run_ablation_configs=args.ablation,
     )

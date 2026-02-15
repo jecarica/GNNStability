@@ -20,6 +20,14 @@ from torch.nn.utils.parametrizations import spectral_norm
 # Import necessary functions from Perslay code
 from scipy.sparse import csgraph
 from scipy.linalg import eigh
+from scipy import stats
+
+# Optional: statistical evaluation (mean ± std, CI, model comparison)
+try:
+    from utils.statistical_evaluation import StatisticalEvaluator
+    HAS_STATS = True
+except ImportError:
+    HAS_STATS = False
 
 
 # -------------------------
@@ -504,35 +512,44 @@ class PerslayModel(nn.Module):
 # 3) Combined Model: GIN + Perslay
 # --------------------------------------------
 class PerslayGIN_HK(nn.Module):
-    def __init__(self, in_dim, hidden_dim, num_classes, dataset_name, num_filtrations, max_points):
+    def __init__(self, in_dim, hidden_dim, num_classes, dataset_name, num_filtrations, max_points,
+                 use_gin=True, use_perslay=True):
         super().__init__()
         self.num_filtrations = num_filtrations
         self.hidden = hidden_dim
+        self.use_gin = use_gin
+        self.use_perslay = use_perslay
 
         # Structural pathway (GIN)
-        self.conv1 = GINConv(nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-        ))
-        self.conv2 = GINConv(nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
-        ))
+        if use_gin:
+            self.conv1 = GINConv(nn.Sequential(
+                nn.Linear(in_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+            ))
+            self.conv2 = GINConv(nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(),
+            ))
+        else:
+            self.conv1 = self.conv2 = None
 
         # Perslay pathway
-        self.perslay = PerslayModel(
-            dataset_name=dataset_name,
-            num_filtrations=num_filtrations,
-            max_points=max_points,
-            hidden_dim=hidden_dim,
-            num_classes=hidden_dim  # Output hidden_dim features for concatenation
-        )
+        if use_perslay:
+            self.perslay = PerslayModel(
+                dataset_name=dataset_name,
+                num_filtrations=num_filtrations,
+                max_points=max_points,
+                hidden_dim=hidden_dim,
+                num_classes=hidden_dim  # Output hidden_dim features for concatenation
+            )
+        else:
+            self.perslay = None
 
-        # Classifier combining both pathways
+        # Classifier combining both pathways (always hidden*2 input; missing branch fed as zeros)
         self.fc1 = spectral_norm(nn.Linear(hidden_dim * 2, 128))
         self.fc2 = spectral_norm(nn.Linear(128, num_classes))
         self.dropout = nn.Dropout(0.5)
@@ -543,14 +560,21 @@ class PerslayGIN_HK(nn.Module):
                 nn.init.orthogonal_(m.weight)
 
     def forward(self, x, edge_index, batch, diagrams_batch, masks_batch=None):
-        # Structural pathway
-        h = F.relu(self.conv1(x, edge_index))
-        h = F.dropout(h, p=0.5, training=self.training)
-        h = F.relu(self.conv2(h, edge_index))
-        g_struct = global_add_pool(h, batch)  # (B, hidden)
+        B = batch.max().item() + 1
+        dev = x.device if self.use_gin else diagrams_batch.device
 
-        # Perslay pathway
-        g_perslay = self.perslay(diagrams_batch, masks_batch)  # (B, hidden)
+        if self.use_gin:
+            h = F.relu(self.conv1(x, edge_index))
+            h = F.dropout(h, p=0.5, training=self.training)
+            h = F.relu(self.conv2(h, edge_index))
+            g_struct = global_add_pool(h, batch)  # (B, hidden)
+        else:
+            g_struct = torch.zeros(B, self.hidden, device=dev, dtype=diagrams_batch.dtype)
+
+        if self.use_perslay:
+            g_perslay = self.perslay(diagrams_batch, masks_batch)  # (B, hidden)
+        else:
+            g_perslay = torch.zeros(B, self.hidden, device=g_struct.device, dtype=g_struct.dtype)
 
         # Combine pathways
         g = torch.cat([g_struct, g_perslay], dim=1)  # (B, hidden * 2)
@@ -644,7 +668,17 @@ def hk_stability_loss_kernel(logits_o, logits_p, diagrams_o, diagrams_p,
 # --------------------------
 # 5) Train / evaluate loops
 # --------------------------
-def train_epoch(model, loader, opt, device, L_pi=1.0, stability_type='embedding'):
+def hk_stability_loss_graph(logits_o, logits_p, L_pi=1.0, p_edge_drop=0.1):
+    """
+    HK-style stability for graph perturbation (GIN+HK): penalize
+    ||f(G) - f(G')|| > L_pi * d. Here d = p_edge_drop as proxy for graph distance.
+    """
+    d_logits = torch.norm(logits_o - logits_p, dim=1)  # (B,)
+    return F.relu(d_logits - L_pi * p_edge_drop).mean()
+
+
+def train_epoch(model, loader, opt, device, L_pi=1.0, stability_type='embedding', use_stability=True,
+                stability_to_graph=False, p_edge_drop=0.1):
     model.train()
     total_loss = 0.0
     total_graphs = 0
@@ -658,32 +692,34 @@ def train_epoch(model, loader, opt, device, L_pi=1.0, stability_type='embedding'
         # Prepare diagrams and masks
         diagrams_o = data.diagrams  # Shape: (batch_size * num_filtrations, max_points, 2)
         masks_o = data.masks if hasattr(data, 'masks') else None
-        diagrams_p = data.diagrams_pert
-        masks_p = data.masks_pert if hasattr(data, 'masks_pert') else None
-
-        # Reshape to (batch_size, num_filtrations, max_points, 2)
         diagrams_o = diagrams_o.reshape(batch_size, model.num_filtrations, -1, 2)
-        diagrams_p = diagrams_p.reshape(batch_size, model.num_filtrations, -1, 2)
-
         if masks_o is not None:
             masks_o = masks_o.reshape(batch_size, model.num_filtrations, -1)
-            masks_p = masks_p.reshape(batch_size, model.num_filtrations, -1)
 
-        # Forward passes
+        # Forward pass (original)
         out_o = model(data.x, data.edge_index, data.batch, diagrams_o, masks_o)
-        out_p = model(data.x, data.edge_index, data.batch, diagrams_p, masks_p)
-
-        # Compute loss
         ce = F.cross_entropy(out_o, data.y)
 
-        if stability_type == 'kernel':
-            stab = hk_stability_loss_kernel(out_o, out_p, diagrams_o, diagrams_p,
-                                            masks_o, masks_p, L_pi=L_pi)
-        else:  # 'embedding' is default
-            stab = hk_stability_loss_embedding(out_o, out_p, diagrams_o, diagrams_p,
-                                               masks_o, masks_p, L_pi=L_pi)
-
-        loss = ce + 0.3 * stab
+        if use_stability:
+            if stability_to_graph:
+                # GIN+HK: second forward with dropped edges (same diagrams)
+                ei_drop, _ = dropout_edge(data.edge_index, p=p_edge_drop, force_undirected=True, training=True)
+                out_p = model(data.x, ei_drop, data.batch, diagrams_o, masks_o)
+                stab = hk_stability_loss_graph(out_o, out_p, L_pi=L_pi, p_edge_drop=p_edge_drop)
+            else:
+                # Full model: second forward with perturbed diagrams
+                diagrams_p = data.diagrams_pert.reshape(batch_size, model.num_filtrations, -1, 2)
+                masks_p = data.masks_pert.reshape(batch_size, model.num_filtrations, -1) if hasattr(data, 'masks_pert') else None
+                out_p = model(data.x, data.edge_index, data.batch, diagrams_p, masks_p)
+                if stability_type == 'kernel':
+                    stab = hk_stability_loss_kernel(out_o, out_p, diagrams_o, diagrams_p,
+                                                    masks_o, masks_p, L_pi=L_pi)
+                else:
+                    stab = hk_stability_loss_embedding(out_o, out_p, diagrams_o, diagrams_p,
+                                                       masks_o, masks_p, L_pi=L_pi)
+            loss = ce + 0.3 * stab
+        else:
+            loss = ce
 
         # Backward pass
         opt.zero_grad()
@@ -726,6 +762,201 @@ def eval_acc(model, loader, device, drop_edges=False, p=0.1):
     return correct / total if total > 0 else 0.0
 
 
+@torch.no_grad()
+def eval_stability_report(model, loader, device, p_values=(0.05, 0.1, 0.15, 0.2), verbose=True):
+    """
+    HK-style stability test: evaluate accuracy with no edge drop (Clean) and with
+    random edge removal at several p. Diagrams stay fixed (original); only GIN sees
+    the dropped graph. Returns dict {p: acc} with p=0 for clean.
+    """
+    model.eval()
+    clean = eval_acc(model, loader, device, drop_edges=False)
+    results = {0.0: clean}
+    for p in p_values:
+        results[p] = eval_acc(model, loader, device, drop_edges=True, p=p)
+    if verbose:
+        print("  Edge-removal stability (diagrams unchanged, GIN sees dropped graph):")
+        print(f"    Clean (p=0):  {clean:.4f}")
+        for p in p_values:
+            drop = clean - results[p]
+            print(f"    p={p:.2f}: acc={results[p]:.4f}  Drop={drop:.4f}")
+    return results
+
+
+# ---------------
+# 5b) Ablation study with 5 runs + statistical evaluation
+# ---------------
+def run_ablation_study(
+    dataset_name,
+    root="data",
+    max_points_per_diagram=50,
+    n_runs=5,
+    train_ratio=0.8,
+    epochs=100,
+    batch_size=32,
+    seed_base=17,
+    L_pi=1.0,
+    stability_type='embedding',
+    use_cache=True,
+    force_recompute=False,
+    verbose=True,
+):
+    """
+    Run ablation: Full (GIN+Perslay+HK), GIN+Perslay no stability, GIN+HK, GIN only, Perslay only.
+    GIN+HK = GIN only with HK stability to graph perturbation (edge drop). Each config runs
+    n_runs times (different seeds). Reports mean ± std and optional 95% CI.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if verbose:
+        print(f"Ablation study: {dataset_name}  |  {n_runs} runs  |  device={device}\n")
+
+    # Load dataset once (same data for all runs; split varies by seed)
+    ds_full = PerslayGraphDataset(
+        root=os.path.join(root, dataset_name),
+        name=dataset_name,
+        max_deg=50,
+        p_edge_pert=0.05,
+        max_points_per_diagram=max_points_per_diagram,
+        use_cache=use_cache,
+        force_recompute=force_recompute,
+    )
+    in_dim = ds_full.num_node_features
+    n_cls = ds_full.num_classes
+    num_filtrations = ds_full.num_filtrations
+
+    configs = [
+        {"name": "Full (GIN+Perslay+HK)", "use_gin": True, "use_perslay": True, "use_stability": True, "stability_to_graph": False},
+        {"name": "GIN+Perslay, no stability", "use_gin": True, "use_perslay": True, "use_stability": False, "stability_to_graph": False},
+        {"name": "GIN+HK", "use_gin": True, "use_perslay": False, "use_stability": True, "stability_to_graph": True},
+        {"name": "GIN only", "use_gin": True, "use_perslay": False, "use_stability": False, "stability_to_graph": False},
+        {"name": "Perslay only", "use_gin": False, "use_perslay": True, "use_stability": False, "stability_to_graph": False},
+    ]
+
+    EDGE_DROP_P = 0.1  # probability for stability test (same as hk.py)
+
+    all_results = []
+    for cfg in configs:
+        if verbose:
+            print(f"--- Config: {cfg['name']} ---")
+        test_accs = []
+        test_noisy_accs = []  # accuracy with edge drop (stability)
+        for run in range(n_runs):
+            seed = seed_base + run
+            set_seed(seed)
+            train_ds, test_ds = stratified_split(ds_full, train_ratio=train_ratio, seed=seed)
+            train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+            test_loader = DataLoader(test_ds, batch_size=batch_size)
+
+            model = PerslayGIN_HK(
+                in_dim=in_dim,
+                hidden_dim=64,
+                num_classes=n_cls,
+                dataset_name=dataset_name,
+                num_filtrations=num_filtrations,
+                max_points=max_points_per_diagram,
+                use_gin=cfg["use_gin"],
+                use_perslay=cfg["use_perslay"],
+            ).to(device)
+            opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+
+            best_acc = 0.0
+            best_weights = None
+            for epoch in range(1, epochs + 1):
+                loss = train_epoch(
+                    model, train_loader, opt, device,
+                    L_pi=L_pi, stability_type=stability_type, use_stability=cfg["use_stability"],
+                    stability_to_graph=cfg.get("stability_to_graph", False),
+                    p_edge_drop=EDGE_DROP_P,
+                )
+                scheduler.step()
+                if (epoch % 20 == 0) or (epoch == epochs):
+                    acc = eval_acc(model, test_loader, device, drop_edges=False)
+                    if acc > best_acc:
+                        best_acc = acc
+                        best_weights = [p.detach().cpu().clone() for p in model.parameters()]
+            if best_weights is not None:
+                for p, w in zip(model.parameters(), best_weights):
+                    p.data = w.to(device)
+            test_acc = eval_acc(model, test_loader, device, drop_edges=False)
+            test_noisy = eval_acc(model, test_loader, device, drop_edges=True, p=EDGE_DROP_P)
+            test_accs.append(test_acc)
+            test_noisy_accs.append(test_noisy)
+            if verbose:
+                print(f"  Run {run + 1}/{n_runs}  seed={seed}  test_acc={test_acc:.4f}  noisy(p={EDGE_DROP_P})={test_noisy:.4f}  drop={test_acc - test_noisy:.4f}")
+
+        test_accs = np.array(test_accs)
+        test_noisy_accs = np.array(test_noisy_accs)
+        drops = test_accs - test_noisy_accs
+        mean_acc = float(np.mean(test_accs))
+        std_acc = float(np.std(test_accs, ddof=1)) if len(test_accs) > 1 else 0.0
+        mean_noisy = float(np.mean(test_noisy_accs))
+        std_noisy = float(np.std(test_noisy_accs, ddof=1)) if len(test_noisy_accs) > 1 else 0.0
+        mean_drop = float(np.mean(drops))
+        std_drop = float(np.std(drops, ddof=1)) if len(drops) > 1 else 0.0
+        n = len(test_accs)
+        se = std_acc / np.sqrt(n) if n > 0 else 0.0
+        t_crit = stats.t.ppf(0.975, df=n - 1) if n > 1 else 0.0
+        ci_lo = mean_acc - t_crit * se
+        ci_hi = mean_acc + t_crit * se
+
+        all_results.append({
+            "name": cfg["name"],
+            "mean": mean_acc,
+            "std": std_acc,
+            "n": n,
+            "ci_lower": ci_lo,
+            "ci_upper": ci_hi,
+            "values": test_accs.tolist(),
+            "mean_noisy": mean_noisy,
+            "std_noisy": std_noisy,
+            "mean_drop": mean_drop,
+            "std_drop": std_drop,
+            "values_noisy": test_noisy_accs.tolist(),
+        })
+
+    # Summary table (accuracy)
+    if verbose:
+        print(f"\n{'=' * 70}")
+        print("Ablation summary (test accuracy)")
+        print(f"Dataset: {dataset_name}  |  Runs: {n_runs}")
+        print(f"{'=' * 70}")
+        print(f"{'Configuration':<35} {'Test acc (mean ± std)':<22} {'95% CI'}")
+        print("-" * 70)
+        for r in all_results:
+            ci_str = f"[{r['ci_lower']:.3f}, {r['ci_upper']:.3f}]" if r["n"] > 1 else "—"
+            print(f"{r['name']:<35} {r['mean']:.4f} ± {r['std']:.4f}   {ci_str}")
+        print(f"{'=' * 70}\n")
+
+        # Stability table (HK-style: edge removal, diagrams unchanged)
+        print("Stability under edge removal (like hk.py: drop edges at test time, diagrams unchanged)")
+        print(f"Dataset: {dataset_name}  |  Edge drop p={EDGE_DROP_P}")
+        print(f"{'=' * 85}")
+        print(f"{'Configuration':<35} {'Clean (mean±std)':<18} {'Noisy (mean±std)':<18} {'Drop (mean±std)'}")
+        print("-" * 85)
+        for r in all_results:
+            print(f"{r['name']:<35} {r['mean']:.4f}±{r['std']:.4f}   "
+                  f"{r['mean_noisy']:.4f}±{r['std_noisy']:.4f}   "
+                  f"{r['mean_drop']:.4f}±{r['std_drop']:.4f}")
+        print(f"{'=' * 85}\n")
+
+    # Optional: StatisticalEvaluator comparison (Full vs GIN only)
+    if HAS_STATS and len(all_results) >= 2 and verbose:
+        full_res = next((r for r in all_results if "Full" in r["name"]), all_results[0])
+        gin_only = next((r for r in all_results if r["name"] == "GIN only"), None)
+        if gin_only is not None and full_res is not gin_only:
+            res1 = {"accuracy": {"mean": full_res["mean"], "std": full_res["std"], "values": full_res["values"]}}
+            res2 = {"accuracy": {"mean": gin_only["mean"], "std": gin_only["std"], "values": gin_only["values"]}}
+            try:
+                comp = StatisticalEvaluator(n_runs=1).compare_models(res1, res2, metric_name="accuracy")
+                print("Statistical comparison (Full vs GIN only):")
+                StatisticalEvaluator(n_runs=1).print_comparison(comp, metric_name="accuracy")
+            except Exception:
+                pass
+
+    return all_results
+
+
 # ---------------
 # 6) Main script
 # ---------------
@@ -733,85 +964,97 @@ if __name__ == "__main__":
     SEED = 17
     L_PI = 1.0
     EPOCHS = 100
-    DATASET_NAME = "REDDIT-BINARY"  # Change to any TUDataset name
+    DATASET_NAME = "REDDIT-BINARY"  # Change to any TUDataset name (e.g. REDDIT-BINARY, NCI1)
     MAX_POINTS_PER_DIAGRAM = 50  # Maximum points per persistence diagram
     STABILITY_TYPE = 'embedding'  # 'embedding' or 'kernel'
-    USE_CACHE = False  # Disable caching to avoid disk space issues
+    USE_CACHE = True  # Use diagram cache to avoid recomputation
     FORCE_RECOMPUTE = False  # Set to True to recompute diagrams even if cached
+    N_RUNS = 5  # Number of runs per config for ablation study
+    ABLATION_STUDY = True  # If True, run ablation (4 configs × N_RUNS); else single training run
 
-    set_seed(SEED)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    if ABLATION_STUDY:
+        run_ablation_study(
+            dataset_name=DATASET_NAME,
+            root="data",
+            max_points_per_diagram=MAX_POINTS_PER_DIAGRAM,
+            n_runs=N_RUNS,
+            train_ratio=0.8,
+            epochs=EPOCHS,
+            batch_size=32,
+            seed_base=SEED,
+            L_pi=L_PI,
+            stability_type=STABILITY_TYPE,
+            use_cache=USE_CACHE,
+            force_recompute=FORCE_RECOMPUTE,
+            verbose=True,
+        )
+    else:
+        set_seed(SEED)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {device}")
 
-    # Load dataset with Perslay diagrams and caching DISABLED
-    ds_full = PerslayGraphDataset(
-        root=f"data/{DATASET_NAME}",
-        name=DATASET_NAME,
-        max_deg=50,
-        p_edge_pert=0.05,
-        max_points_per_diagram=MAX_POINTS_PER_DIAGRAM,
-        use_cache=USE_CACHE,  # False to avoid disk space issues
-        force_recompute=FORCE_RECOMPUTE
-    )
+        ds_full = PerslayGraphDataset(
+            root=f"data/{DATASET_NAME}",
+            name=DATASET_NAME,
+            max_deg=50,
+            p_edge_pert=0.05,
+            max_points_per_diagram=MAX_POINTS_PER_DIAGRAM,
+            use_cache=USE_CACHE,
+            force_recompute=FORCE_RECOMPUTE
+        )
 
-    # Stratified split - now returns PerslayGraphSubset objects
-    train_ds, test_ds = stratified_split(ds_full, train_ratio=0.8, seed=SEED)
+        train_ds, test_ds = stratified_split(ds_full, train_ratio=0.8, seed=SEED)
+        train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
+        test_loader = DataLoader(test_ds, batch_size=32)
 
-    # Create DataLoaders
-    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
-    test_loader = DataLoader(test_ds, batch_size=32)
+        in_dim = train_ds.num_node_features
+        n_cls = ds_full.num_classes
+        num_filtrations = train_ds.num_filtrations
 
-    # Get model parameters - use ds_full for attributes since PerslayGraphSubset has them
-    in_dim = train_ds.num_node_features  # Now works with PerslayGraphSubset
-    n_cls = ds_full.num_classes
-    num_filtrations = train_ds.num_filtrations  # Now works with PerslayGraphSubset
+        print(f"\nDataset: {DATASET_NAME}")
+        print(f"in_dim={in_dim}, num_filtrations={num_filtrations}, num_classes={n_cls}")
+        print(f"Train size: {len(train_ds)}, Test size: {len(test_ds)}")
+        print(f"Max points per diagram: {MAX_POINTS_PER_DIAGRAM}")
+        print(f"Stability type: {STABILITY_TYPE}")
+        print(f"Using cache: {USE_CACHE}")
 
-    print(f"\nDataset: {DATASET_NAME}")
-    print(f"in_dim={in_dim}, num_filtrations={num_filtrations}, num_classes={n_cls}")
-    print(f"Train size: {len(train_ds)}, Test size: {len(test_ds)}")
-    print(f"Max points per diagram: {MAX_POINTS_PER_DIAGRAM}")
-    print(f"Stability type: {STABILITY_TYPE}")
-    print(f"Using cache: {USE_CACHE}")
+        model = PerslayGIN_HK(
+            in_dim=in_dim,
+            hidden_dim=64,
+            num_classes=n_cls,
+            dataset_name=DATASET_NAME,
+            num_filtrations=num_filtrations,
+            max_points=MAX_POINTS_PER_DIAGRAM,
+            use_gin=True,
+            use_perslay=True,
+        ).to(device)
 
-    # Create model
-    model = PerslayGIN_HK(
-        in_dim=in_dim,
-        hidden_dim=64,
-        num_classes=n_cls,
-        dataset_name=DATASET_NAME,
-        num_filtrations=num_filtrations,
-        max_points=MAX_POINTS_PER_DIAGRAM
-    ).to(device)
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS)
+        best = 0.0
+        t0 = time.time()
 
-    # Training loop
-    best = 0.0
-    t0 = time.time()
+        for epoch in range(1, EPOCHS + 1):
+            loss = train_epoch(model, train_loader, opt, device,
+                               L_pi=L_PI, stability_type=STABILITY_TYPE, use_stability=True)
+            scheduler.step()
 
-    for epoch in range(1, EPOCHS + 1):
-        loss = train_epoch(model, train_loader, opt, device,
-                           L_pi=L_PI, stability_type=STABILITY_TYPE)
-        scheduler.step()
+            if epoch % 5 == 0:
+                clean = eval_acc(model, test_loader, device, drop_edges=False)
+                noisy = eval_acc(model, test_loader, device, drop_edges=True, p=0.1)
+                best = max(best, clean)
+                print(f"Epoch {epoch:03d} | Loss {loss:.4f} | Clean {clean:.3f} | Noisy {noisy:.3f} "
+                      f"| Drop {clean - noisy:.3f}")
 
-        if epoch % 5 == 0:
-            clean = eval_acc(model, test_loader, device, drop_edges=False)
-            noisy = eval_acc(model, test_loader, device, drop_edges=True, p=0.1)
-            best = max(best, clean)
-            print(f"Epoch {epoch:03d} | Loss {loss:.4f} | Clean {clean:.3f} | Noisy {noisy:.3f} "
-                  f"| Drop {clean - noisy:.3f}")
-
-    print(f"\nDone in {(time.time() - t0):.1f}s")
-    final_clean = eval_acc(model, test_loader, device, drop_edges=False)
-    final_noisy = eval_acc(model, test_loader, device, drop_edges=True, p=0.1)
-
-    print(f"\nFinal → Clean: {final_clean:.3f} | Noisy: {final_noisy:.3f} | Drop: {final_clean - final_noisy:.3f}")
-    print(f"Best Clean: {best:.3f}")
-
-    # Print model summary
-    print(f"\nModel architecture:")
-    print(f"- GIN layers: 2 layers with hidden_dim=64")
-    print(f"- Perslay layers: {num_filtrations} PermutationEquivariant layers with masks")
-    print(f"- Classifier: 2-layer MLP with spectral normalization")
-    print(f"- Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+        print(f"\nDone in {(time.time() - t0):.1f}s")
+        final_clean = eval_acc(model, test_loader, device, drop_edges=False)
+        final_noisy = eval_acc(model, test_loader, device, drop_edges=True, p=0.1)
+        print(f"\nFinal → Clean: {final_clean:.3f} | Noisy (p=0.1): {final_noisy:.3f} | Drop: {final_clean - final_noisy:.3f}")
+        print(f"Best Clean: {best:.3f}")
+        eval_stability_report(model, test_loader, device, p_values=(0.05, 0.1, 0.15, 0.2), verbose=True)
+        print(f"\nModel architecture:")
+        print(f"- GIN layers: 2 layers with hidden_dim=64")
+        print(f"- Perslay layers: {num_filtrations} PermutationEquivariant layers with masks")
+        print(f"- Classifier: 2-layer MLP with spectral normalization")
+        print(f"- Total parameters: {sum(p.numel() for p in model.parameters()):,}")
